@@ -244,7 +244,7 @@ Test the complete system immediately without installing or running a local MySQL
 
 ```bash
 # Windows PowerShell
-.\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=h2
+.\mvnw.cmd spring-boot:run "-Dspring-boot.run.profiles=h2"
 
 # Linux / macOS
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=h2
@@ -343,7 +343,17 @@ The system automatically initializes two development accounts at application sta
 
 ## REST API Endpoint Reference
 
-All protected endpoints accept **HTTP Basic Authentication** (`Authorization: Basic <base64(user:password)>`).
+NexusHR supports two verified authentication mechanisms:
+
+1. **HTTP Basic Authentication (Stateless API Integration)**:
+   - Provide the standard header `Authorization: Basic <base64(user:password)>` with every API request.
+   - Recommended for CLI tools, cURL, OpenAPI Swagger UI, Postman, and automated test suites.
+2. **Session-Based Authentication (Browser SPA & Cookies)**:
+   - Call `POST /api/auth/login` with JSON payload `{"username": "...", "password": "..."}`.
+   - On successful authentication, Spring Security establishes a servlet `HttpSession` and returns a `Set-Cookie: JSESSIONID=...` header.
+   - Subsequent browser requests automatically transmit the session cookie.
+   - Call `GET /api/auth/me` to inspect the active identity and granted roles.
+   - Call `POST /api/auth/logout` to invalidate the active session and clear credentials.
 
 ### 1. Employee Endpoints
 
@@ -533,23 +543,99 @@ curl -s -u user@company.com:User@123 -X POST "http://localhost:8080/api/ai/query
 
 ---
 
+### 6. Session-Based Authentication Workflow (Login, Verify Session, Logout)
+
+**Step A: Authenticate and Save Session Cookie**
+```bash
+curl -s -i -c cookies.txt -X POST "http://localhost:8080/api/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin@company.com","password":"Admin@123"}'
+```
+
+**Response (HTTP 200 OK with `Set-Cookie` header):**
+```json
+{
+  "success": true,
+  "message": "Login successful",
+  "data": {
+    "username": "admin@company.com",
+    "name": "admin@company.com",
+    "roles": ["ROLE_ADMIN"],
+    "isAdmin": true,
+    "message": "Authentication successful"
+  }
+}
+```
+
+**Step B: Access Protected Resource Using Saved Cookie**
+```bash
+curl -s -b cookies.txt "http://localhost:8080/api/auth/me"
+```
+
+**Response (HTTP 200 OK):**
+```json
+{
+  "success": true,
+  "data": {
+    "username": "admin@company.com",
+    "name": "admin@company.com",
+    "roles": ["ROLE_ADMIN"],
+    "isAdmin": true,
+    "message": "User authenticated"
+  }
+}
+```
+
+**Step C: Invalidate Active Session (Logout)**
+```bash
+curl -s -b cookies.txt -X POST "http://localhost:8080/api/auth/logout"
+```
+
+**Response (HTTP 200 OK):**
+```json
+{
+  "success": true,
+  "message": "Logged out successfully",
+  "data": "Session ended"
+}
+```
+
+---
+
 ## AI Integration & Fallback Engine
 
-NexusHR implements a resilient, multi-tiered AI architecture designed for enterprise safety and reliability:
+NexusHR implements a resilient, multi-tiered AI architecture designed for enterprise safety, high availability, and data protection:
 
-1. **Controlled Grounded Context:**
-   The backend retrieves factual mathematical metrics (aggregate employee counts, departmental numbers, and recent joiner counts) via JPA queries before interacting with any language model. The prompt contains strictly structured facts.
-2. **Provider Agnostic:**
-   The `AiClient` interface supports any standard OpenAI-compatible API (OpenAI, Gemini via OpenAI adapter, Azure OpenAI, LocalAI, vLLM, or Ollama) configured through `AI_BASE_URL` and `AI_MODEL`.
-3. **Deterministic Fallback Engine:**
-   When `AI_API_KEY` is not supplied or if an external network timeout occurs, `RuleBasedFallbackEngine` takes over instantly:
-   - Processes questions regarding headcount rankings, active ratios, comparisons, and distributions.
-   - Computes empirical workforce trends (e.g. key-person dependency in small departments, high functional concentration).
-   - Generates actionable operational recommendations (e.g. cross-training coverage for staff on leave, data hygiene for archived records).
-   - Clearly labels all generated content with either `AI_LLM` or `RULE_BASED`.
-4. **Safety & Privacy Constraints:**
-   - No individual passwords, credentials, or personal identifying numbers are ever transmitted to the LLM.
-   - The AI assistant is strictly read-only and has **no mechanism to create, alter, or delete database records**.
+### 1. Controlled Grounded Context Prompting
+The backend never executes unconstrained SQL queries and never sends private employee records or passwords to language models. Instead:
+- JPA queries execute pre-defined mathematical aggregations (`COUNT`, group-by-department headcount, active/leave ratios, new joiner counts over 30/90 days).
+- Grounded metrics are injected into a strict system prompt instruction: *"Answer using ONLY the provided verified metrics facts. Never fabricate metrics. Never generate SQL. Do not disclose personal employee credentials or passwords."*
+
+### 2. Supported AI Providers & Endpoint Mapping
+NexusHR connects to external AI providers via standard OpenAI-compatible REST endpoints (`POST /chat/completions`):
+
+| Provider | `AI_BASE_URL` | `AI_MODEL` | Requirements |
+|---|---|---|---|
+| **OpenAI** (Default) | `https://api.openai.com/v1` | `gpt-4o-mini` | Set `AI_API_KEY=sk-...` |
+| **Google Gemini** | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-1.5-flash` | Set Gemini API key in `AI_API_KEY` |
+| **Ollama** (Local / Self-hosted) | `http://localhost:11434/v1` | `llama3` | Run `ollama run llama3`; set `AI_API_KEY=ollama` |
+| **Azure OpenAI / vLLM / LocalAI** | `https://<resource>.openai.azure.com/openai/deployments/<model>` | `<deployment-name>` | Set endpoint and authentication key |
+
+### 3. Missing-Key Detection & Automatic Bypassing
+If `AI_API_KEY` is empty, omitted, or left as the default placeholder (`your-openai-api-key-here`), `AiClient.isConfigured()` evaluates to `false`. The backend completely skips outbound HTTP requests, preventing external network latency or authentication failures, and immediately serves responses from the internal rule engine.
+
+### 4. Timeout Handling & Fault-Tolerant Fallback
+Network requests to external AI APIs are wrapped in a `SimpleClientHttpRequestFactory` with connect and read timeouts configured by `AI_TIMEOUT_SECONDS` (default: `15` seconds).
+- If the provider times out, returns HTTP 4xx/5xx, or experiences connection refusal, the exception is caught and logged at `WARN` level.
+- The request is immediately and seamlessly handed off to `RuleBasedFallbackEngine`.
+- The API response payload indicates the true generation origin (`source: "AI_LLM"` vs `source: "RULE_BASED"`).
+
+### 5. Executive Report Generation & Audit Persistence
+When an administrator generates an executive report (`POST /api/ai/report`):
+- Date-bounded aggregation queries calculate active employee distribution, period joiners, and headcount dynamics.
+- An executive summary is drafted (via LLM or deterministic engine).
+- Key operational metrics, observed workforce trends, and prioritized recommendations are generated.
+- The full report audit snapshot is persisted to the database table `ai_report_history` (`AiReportHistory` entity), allowing historic report retrieval via `GET /api/ai/reports/history`.
 
 ---
 
@@ -583,20 +669,32 @@ To execute all tests:
 ### 1. Port 8080 Already in Use
 If port 8080 is occupied by another process:
 ```bash
-# Override via environment variable
+# Windows PowerShell
+$env:SERVER_PORT="8081"
+.\mvnw.cmd spring-boot:run
+# Or pass arguments directly:
+.\mvnw.cmd spring-boot:run "-Dspring-boot.run.arguments=--server.port=8081"
+
+# Linux / macOS
 export SERVER_PORT=8081
 ./mvnw spring-boot:run
-
-# Or via command line parameter
-.\mvnw.cmd spring-boot:run -Dspring-boot.run.arguments="--server.port=8081"
+# Or pass arguments directly:
+./mvnw spring-boot:run -Dspring-boot.run.arguments="--server.port=8081"
 ```
 
 ### 2. MySQL Connection Refused
 If you see `CommunicationsException: Communications link failure`:
-- Ensure your MySQL server service is started (`net start MySQL80` or `systemctl start mysql`).
+- Ensure your MySQL server service is running (`net start MySQL80` on Windows, or `sudo systemctl start mysql` on Linux).
 - Check that the database `employee_db` exists or that `createDatabaseIfNotExist=true` is enabled in the JDBC URL.
 - Verify your password in `SPRING_DATASOURCE_PASSWORD`.
-- Alternatively, run with the in-memory profile: `.\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=h2`.
+- Alternatively, run with the in-memory profile:
+  ```bash
+  # Windows PowerShell
+  .\mvnw.cmd spring-boot:run "-Dspring-boot.run.profiles=h2"
+
+  # Linux / macOS
+  ./mvnw spring-boot:run -Dspring-boot.run.profiles=h2
+  ```
 
 ### 3. PowerShell Character Escaping with cURL
 On Windows PowerShell, `curl` is often aliased to `Invoke-WebRequest`, and quotes can be stripped. Use `curl.exe` with escaped quotes or `Invoke-RestMethod`:
