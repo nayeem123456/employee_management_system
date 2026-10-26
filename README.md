@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # NexusHR - AI-Powered Employee Management System
 
 [![Java Version](https://img.shields.io/badge/Java-21%20LTS-orange.svg)](https://adoptium.net/)
@@ -718,3 +719,6 @@ Invoke-RestMethod -Uri "http://localhost:8080/api/dashboard/summary" -Headers $h
 ## License
 
 This project is licensed under the **Apache License 2.0**. See the [LICENSE](LICENSE) file for details.
+=======
+# employee_management_system
+>>>>>>> f89ad4cd0c330b2a1aed03fe31fbcfbdf862a1a9
